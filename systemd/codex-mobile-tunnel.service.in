@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Mobile Cloudflare quick tunnel
+After=network-online.target codex-mobile-server.service
+Wants=codex-mobile-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_DIR__
+Environment=CLOUDFLARED_BIN=__PROJECT_DIR__/bin/cloudflared
+ExecStart=__PROJECT_DIR__/bin/cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
