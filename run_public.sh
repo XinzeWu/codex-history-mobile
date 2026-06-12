@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="${CODEX_MOBILE_RELEASE_DIR:-$HOME/codex-mobile-release}"
+if [ -d "$APP_DIR" ]; then
+    cd "$APP_DIR"
+else
+    cd "$SCRIPT_DIR"
+fi
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8787}"
-SERVER_LOG="${SERVER_LOG:-server.log}"
-TUNNEL_LOG="${TUNNEL_LOG:-tunnel.log}"
-SERVER_PID="${SERVER_PID:-server.pid}"
-TUNNEL_PID="${TUNNEL_PID:-tunnel.pid}"
+RUN_SOURCE="${RUN_SOURCE:-manual}"
+RUN_SOURCE="${RUN_SOURCE//[^A-Za-z0-9_.-]/_}"
+RUN_DIR="${RUN_DIR:-run/${RUN_SOURCE}}"
+LOG_DIR="${LOG_DIR:-logs/${RUN_SOURCE}}"
+SERVER_LOG="${SERVER_LOG:-${LOG_DIR}/server.log}"
+TUNNEL_LOG="${TUNNEL_LOG:-${LOG_DIR}/tunnel.log}"
+SERVER_PID="${SERVER_PID:-${RUN_DIR}/server.pid}"
+TUNNEL_PID="${TUNNEL_PID:-${RUN_DIR}/tunnel.pid}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-./bin/cloudflared}"
+CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+export CODEX_BIN
+
+mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 is_running() {
     local pid_file="$1"
@@ -17,7 +31,6 @@ is_running() {
 }
 
 server_running() {
-    systemctl --user is-active --quiet codex-mobile-server.service 2>/dev/null && return 0
     is_running "$SERVER_PID" && return 0
     pgrep -f "python3 server.py --host ${HOST} --port ${PORT}" >/dev/null 2>&1
 }
@@ -27,15 +40,14 @@ start_server() {
         return
     fi
     rm -f "$SERVER_PID"
-    : > "$SERVER_LOG"
-    setsid nohup ./start.sh > "$SERVER_LOG" 2>&1 &
+    {
+        printf '\n[%s] starting server source=%s host=%s port=%s\n' "$(date -Is)" "$RUN_SOURCE" "$HOST" "$PORT"
+    } >> "$SERVER_LOG"
+    setsid nohup ./start.sh >> "$SERVER_LOG" 2>&1 &
     echo "$!" > "$SERVER_PID"
 }
 
 start_tunnel() {
-    if systemctl --user is-active --quiet codex-mobile-tunnel.service 2>/dev/null; then
-        return
-    fi
     if is_running "$TUNNEL_PID"; then
         return
     fi
@@ -48,8 +60,10 @@ start_tunnel() {
         fi
     fi
     rm -f "$TUNNEL_PID"
-    : > "$TUNNEL_LOG"
-    setsid nohup "$CLOUDFLARED_BIN" tunnel --url "http://127.0.0.1:${PORT}" --no-autoupdate > "$TUNNEL_LOG" 2>&1 &
+    {
+        printf '\n[%s] starting tunnel source=%s url=http://127.0.0.1:%s\n' "$(date -Is)" "$RUN_SOURCE" "$PORT"
+    } >> "$TUNNEL_LOG"
+    setsid nohup "$CLOUDFLARED_BIN" tunnel --url "http://127.0.0.1:${PORT}" --no-autoupdate >> "$TUNNEL_LOG" 2>&1 &
     echo "$!" > "$TUNNEL_PID"
 }
 

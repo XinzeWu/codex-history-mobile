@@ -62,6 +62,15 @@ INPUTBOX_QUEUE = []
 INPUTBOX_LOCK = threading.Lock()
 
 
+def codex_env():
+    env = os.environ.copy()
+    codex_dir = str(Path(CODEX_BIN).expanduser().parent)
+    current_path = env.get("PATH", "")
+    env["PATH"] = codex_dir + (os.pathsep + current_path if current_path else "")
+    env["CODEX_BIN"] = CODEX_BIN
+    return env
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1170,9 +1179,18 @@ def list_sessions():
     conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
+        columns = {row[1] for row in conn.execute("pragma table_info(threads)").fetchall()}
+        preview_expr = "preview" if "preview" in columns else "first_user_message"
+        archived_expr = "archived" if "archived" in columns else "0"
+        updated_expr = (
+            "coalesce(updated_at_ms, updated_at * 1000, created_at_ms, created_at * 1000, 0)"
+        )
         rows = conn.execute(
-            """
-            select id, title, rollout_path, cwd, updated_at_ms, preview, archived
+            f"""
+            select id, title, rollout_path, cwd,
+                   {updated_expr} as updated_at_ms,
+                   {preview_expr} as preview,
+                   {archived_expr} as archived
             from threads
             order by updated_at_ms desc
             limit 200
@@ -1605,6 +1623,7 @@ def ensure_remote_control():
     proc = subprocess.run(
         [CODEX_BIN, "remote-control", "start", "--json"],
         text=True,
+        env=codex_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=str(HOME),
@@ -1709,6 +1728,7 @@ def run_codex_job(job_id, session_id, message):
             cmd,
             input=message,
             text=True,
+            env=codex_env(),
             cwd=str(HOME),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
