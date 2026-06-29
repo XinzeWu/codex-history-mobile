@@ -3,6 +3,7 @@ import argparse
 import base64
 import hashlib
 import json
+import mimetypes
 import os
 import secrets
 import sqlite3
@@ -60,6 +61,17 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 INPUTBOX_QUEUE = []
 INPUTBOX_LOCK = threading.Lock()
+FILE_ROOTS = [HOME, Path("/nfs")]
+BLOCKED_FILE_NAMES = {".env", ".git-credentials", "token.txt"}
+BLOCKED_FILE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+BLOCKED_FILE_PARTS = {".ssh", ".gnupg"}
+TEXT_PREVIEW_SUFFIXES = {
+    ".txt", ".md", ".json", ".jsonl", ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".html", ".css", ".sh", ".bash", ".zsh", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".conf", ".log", ".csv", ".sql", ".xml",
+}
+IMAGE_PREVIEW_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+MAX_TEXT_PREVIEW_BYTES = 1024 * 1024
 
 
 def codex_env():
@@ -90,6 +102,57 @@ INDEX_HTML = r"""<!doctype html>
       --user: #dff5ee;
       --assistant: #ffffff;
       --danger: #b42318;
+      --sidebar-bg: #eef1f5;
+      --button-bg: #ffffff;
+      --active-bg: #ffffff;
+      --active-border: #94bdb8;
+      --soft-bg: #edfdfa;
+      --soft-text: #115e59;
+      --code-bg: #eef1f5;
+      --pre-bg: #111827;
+      --pre-text: #e5e7eb;
+      --quote-text: #475467;
+      --table-bg: #ffffff;
+      --job-bg: #fff7ed;
+      --job-border: #fed7aa;
+      --failed-bg: #fff1f2;
+      --failed-border: #fecdd3;
+      --terminal-bg: #111827;
+      --terminal-text: #d1fae5;
+      --header-bg: rgba(255,255,255,.78);
+      --link: #0f766e;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #111318;
+      --panel: #181b22;
+      --text: #e6e8ee;
+      --muted: #9aa3b2;
+      --line: #303642;
+      --accent: #14b8a6;
+      --accent-2: #d5dae3;
+      --user: #113d37;
+      --assistant: #1b2028;
+      --danger: #fca5a5;
+      --sidebar-bg: #151922;
+      --button-bg: #202631;
+      --active-bg: #202631;
+      --active-border: #2dd4bf;
+      --soft-bg: #123d38;
+      --soft-text: #99f6e4;
+      --code-bg: #242b36;
+      --pre-bg: #090b10;
+      --pre-text: #e6e8ee;
+      --quote-text: #c1c7d0;
+      --table-bg: #181d26;
+      --job-bg: #322215;
+      --job-border: #7c4a16;
+      --failed-bg: #371b24;
+      --failed-border: #7f1d1d;
+      --terminal-bg: #090b10;
+      --terminal-text: #99f6e4;
+      --header-bg: rgba(24,27,34,.86);
+      --link: #5eead4;
     }
     * { box-sizing: border-box; }
     body {
@@ -109,7 +172,7 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 0;
     }
     aside {
-      background: #eef1f5;
+      background: var(--sidebar-bg);
       border-right: 1px solid var(--line);
       min-height: 0;
       min-width: 0;
@@ -133,7 +196,7 @@ INDEX_HTML = r"""<!doctype html>
       justify-content: space-between;
       padding: 0 14px;
       border-bottom: 1px solid var(--line);
-      background: rgba(255,255,255,.78);
+      background: var(--header-bg);
       backdrop-filter: blur(10px);
     }
     h1 {
@@ -158,7 +221,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 28px;
       border-radius: 7px;
       border: 1px solid var(--line);
-      background: #fff;
+      background: var(--button-bg);
       color: var(--accent-2);
       font-size: 14px;
       display: inline-grid;
@@ -195,8 +258,8 @@ INDEX_HTML = r"""<!doctype html>
       transition: opacity .16s ease, transform .16s ease;
     }
     .session.active {
-      border-color: #94bdb8;
-      background: #ffffff;
+      border-color: var(--active-border);
+      background: var(--active-bg);
     }
     .session .title {
       font-size: 15px;
@@ -242,7 +305,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 22px;
       border-radius: 6px;
       border: 1px solid var(--line);
-      background: #fff;
+      background: var(--button-bg);
       color: var(--accent-2);
       font-size: 12px;
       line-height: 1;
@@ -252,9 +315,9 @@ INDEX_HTML = r"""<!doctype html>
       appearance: none;
     }
     .session-action.done {
-      border-color: #99c2bd;
-      background: #edfdfa;
-      color: #115e59;
+      border-color: var(--active-border);
+      background: var(--soft-bg);
+      color: var(--soft-text);
     }
     .session-group {
       width: 100%;
@@ -262,7 +325,7 @@ INDEX_HTML = r"""<!doctype html>
       padding: 10px 8px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: #fff;
+      background: var(--button-bg);
       color: var(--muted);
       font-size: 12px;
       font-weight: 750;
@@ -271,8 +334,115 @@ INDEX_HTML = r"""<!doctype html>
     }
     .session.hidden-card {
       opacity: .72;
-      background: #f8fafc;
+      background: var(--panel);
       border-style: dashed;
+    }
+    .file-entry {
+      min-height: 58px;
+      border: 1px solid var(--line);
+      background: var(--button-bg);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .file-entry.active {
+      border-color: var(--active-border);
+      background: var(--active-bg);
+    }
+    .file-browser {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .file-browser.open { display: flex; }
+    .file-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+    .file-path {
+      flex: 1 0 100%;
+      order: 2;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--button-bg);
+      color: var(--text);
+      padding: 9px 10px;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      outline: 0;
+    }
+    .file-btn {
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--button-bg);
+      color: var(--accent-2);
+      font-weight: 650;
+      padding: 0 10px;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .file-layout {
+      display: grid;
+      grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+      gap: 10px;
+      min-height: 0;
+      flex: 1;
+    }
+    .file-list,
+    .file-preview {
+      min-height: 0;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .file-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+    }
+    .file-row:last-child { border-bottom: 0; }
+    .file-row.active { background: var(--active-bg); }
+    .file-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 650;
+    }
+    .file-meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .file-preview {
+      padding: 12px;
+    }
+    .file-preview pre {
+      margin: 0;
+      white-space: pre;
+      overflow: auto;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .file-preview img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 8px;
+      border: 1px solid var(--line);
     }
     main {
       min-width: 0;
@@ -296,7 +466,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 38px;
       border-radius: 8px;
       border: 1px solid var(--line);
-      background: #fff;
+      background: var(--button-bg);
       font-size: 20px;
     }
     .thread-title {
@@ -311,19 +481,34 @@ INDEX_HTML = r"""<!doctype html>
     .refresh {
       height: 38px;
       border: 1px solid var(--line);
-      background: #fff;
+      background: var(--button-bg);
       border-radius: 8px;
       padding: 0 12px;
       color: var(--accent-2);
       font-weight: 650;
     }
+    .theme-toggle {
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line);
+      background: var(--button-bg);
+      border-radius: 8px;
+      color: var(--accent-2);
+      font-size: 16px;
+      line-height: 1;
+      display: inline-grid;
+      place-items: center;
+      padding: 0;
+      appearance: none;
+    }
     .mode {
       height: 38px;
-      border: 1px solid #99c2bd;
-      background: #edfdfa;
+      border: 1px solid var(--active-border);
+      border-color: var(--active-border);
+      background: var(--soft-bg);
       border-radius: 8px;
       padding: 0 12px;
-      color: #115e59;
+      color: var(--soft-text);
       font-weight: 750;
     }
     .messages {
@@ -349,16 +534,16 @@ INDEX_HTML = r"""<!doctype html>
     .msg.user {
       align-self: flex-end;
       background: var(--user);
-      border-color: #b9e7db;
+      border-color: var(--active-border);
     }
     .msg.job {
       align-self: flex-end;
-      background: #fff7ed;
-      border-color: #fed7aa;
+      background: var(--job-bg);
+      border-color: var(--job-border);
     }
     .msg.job.failed {
-      background: #fff1f2;
-      border-color: #fecdd3;
+      background: var(--failed-bg);
+      border-color: var(--failed-border);
     }
     .msg .content {
       display: block;
@@ -387,15 +572,15 @@ INDEX_HTML = r"""<!doctype html>
       margin: 8px 0;
       padding: 10px;
       border-radius: 8px;
-      background: #111827;
-      color: #e5e7eb;
+      background: var(--pre-bg);
+      color: var(--pre-text);
       overflow: auto;
       white-space: pre;
       font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     .content code {
       border-radius: 5px;
-      background: #eef1f5;
+      background: var(--code-bg);
       padding: 1px 5px;
       font: .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
@@ -413,11 +598,11 @@ INDEX_HTML = r"""<!doctype html>
     .content blockquote {
       margin: 8px 0;
       padding: 2px 0 2px 10px;
-      border-left: 3px solid #94bdb8;
-      color: #475467;
+      border-left: 3px solid var(--active-border);
+      color: var(--quote-text);
     }
     .content a {
-      color: #0f766e;
+      color: var(--link);
       text-decoration: underline;
       overflow-wrap: anywhere;
     }
@@ -427,7 +612,7 @@ INDEX_HTML = r"""<!doctype html>
       margin: 8px 0 10px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: #fff;
+      background: var(--table-bg);
     }
     .content table {
       width: 100%;
@@ -452,7 +637,7 @@ INDEX_HTML = r"""<!doctype html>
       border-bottom: 0;
     }
     .content th {
-      background: #eef1f5;
+      background: var(--code-bg);
       font-weight: 750;
     }
     .msg .role {
@@ -470,7 +655,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 24px;
       border-radius: 6px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,.88);
+      background: var(--button-bg);
       color: var(--accent-2);
       font-size: 12px;
       line-height: 1;
@@ -480,9 +665,9 @@ INDEX_HTML = r"""<!doctype html>
       appearance: none;
     }
     .msg-copy.done {
-      border-color: #99c2bd;
-      background: #edfdfa;
-      color: #115e59;
+      border-color: var(--active-border);
+      background: var(--soft-bg);
+      color: var(--soft-text);
     }
     .composer {
       border-top: 1px solid var(--line);
@@ -520,8 +705,8 @@ INDEX_HTML = r"""<!doctype html>
     .terminal {
       display: none;
       border-top: 1px solid var(--line);
-      background: #111827;
-      color: #d1fae5;
+      background: var(--terminal-bg);
+      color: var(--terminal-text);
       max-height: 26vh;
       min-height: 108px;
       overflow: auto;
@@ -572,6 +757,10 @@ INDEX_HTML = r"""<!doctype html>
         order: 2;
         padding: 10px;
       }
+      .file-browser { order: 2; padding: 10px; }
+      .file-layout { grid-template-columns: 1fr; }
+      .file-list,
+      .file-preview { max-height: none; }
       .msg { max-width: 96%; }
       .terminal { order: 3; max-height: 22vh; min-height: 84px; }
     }
@@ -594,14 +783,29 @@ INDEX_HTML = r"""<!doctype html>
       <div class="toolbar">
         <button class="mobile-menu" id="menuBtn" title="会话">☰</button>
         <div class="thread-title" id="threadTitle">选择一个会话</div>
+        <button class="theme-toggle" id="themeBtn" type="button" title="切换明暗主题">☾</button>
         <button class="mode" id="terminalBtn">历史</button>
         <button class="refresh" id="refreshBtn">刷新</button>
       </div>
       <div class="messages" id="messages">
         <div class="notice">选择左侧会话后，就可以在手机上查看消息并发送新指令。</div>
       </div>
+      <div class="file-browser" id="fileBrowser">
+        <div class="file-bar">
+          <button class="file-btn" id="fileUpBtn" type="button">上级</button>
+          <input class="file-path" id="filePathInput" value="/home/wxz" spellcheck="false" autocomplete="off">
+          <button class="file-btn" id="fileGoBtn" type="button">打开</button>
+          <button class="file-btn" id="fileCopyBtn" type="button">复制</button>
+          <button class="file-btn" id="fileHiddenBtn" type="button">显示隐藏</button>
+          <button class="file-btn" id="fileRefreshBtn" type="button">刷新</button>
+        </div>
+        <div class="file-layout">
+          <div class="file-list" id="fileList"></div>
+          <div class="file-preview" id="filePreview"><div class="notice">选择文件预览，或点击目录进入。</div></div>
+        </div>
+      </div>
       <div class="terminal" id="terminal">共享历史状态加载中</div>
-      <div class="composer">
+      <div class="composer" id="composer">
         <textarea id="input" placeholder="输入后写入当前会话历史"></textarea>
         <button class="send" id="sendBtn">发送</button>
       </div>
@@ -611,9 +815,12 @@ INDEX_HTML = r"""<!doctype html>
     const params = new URLSearchParams(location.search);
     const token = params.get("token") || localStorage.getItem("codexMobileToken") || "";
     if (token) localStorage.setItem("codexMobileToken", token);
+    const savedTheme = localStorage.getItem("codexMobileTheme") || "light";
+    document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
     const explicitSessionId = params.get("session_id") || "";
     let sessions = [];
     let activeId = explicitSessionId || localStorage.getItem("codexMobileSession") || "";
+    let activeMode = localStorage.getItem("codexMobileMode") || "chat";
     let firstSessionLoad = true;
     let loadedThreadIds = [];
     let currentSessionId = "";
@@ -626,6 +833,14 @@ INDEX_HTML = r"""<!doctype html>
     let uiEvents = [];
     let lastRenderedItems = [];
     let lastRefreshError = "";
+    let sessionsRevision = "";
+    let messagesRevisionBySession = {};
+    let jobsRevision = "";
+    let filePath = localStorage.getItem("codexMobileFilePath") || "/home/wxz";
+    let fileParent = "";
+    let fileRevision = "";
+    let selectedFilePath = "";
+    let showHiddenFiles = localStorage.getItem("codexMobileShowHiddenFiles") === "1";
     let hiddenSessionIds = new Set(JSON.parse(localStorage.getItem("codexMobileHiddenSessions") || "[]"));
     let titleOverrides = JSON.parse(localStorage.getItem("codexMobileSessionTitles") || "{}");
     let hiddenPanelOpen = localStorage.getItem("codexMobileHiddenPanelOpen") === "1";
@@ -633,6 +848,18 @@ INDEX_HTML = r"""<!doctype html>
     const api = (path, opts = {}) => fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token), opts);
     const savedSidebarWidth = localStorage.getItem("codexMobileSidebarWidth");
     if (savedSidebarWidth) document.documentElement.style.setProperty("--sidebar-width", savedSidebarWidth);
+
+    function applyTheme(theme) {
+      const next = theme === "dark" ? "dark" : "light";
+      document.documentElement.dataset.theme = next;
+      localStorage.setItem("codexMobileTheme", next);
+      const btn = qs("#themeBtn");
+      if (btn) {
+        btn.textContent = next === "dark" ? "☀" : "☾";
+        btn.title = next === "dark" ? "切换到白天模式" : "切换到黑夜模式";
+        btn.setAttribute("aria-label", btn.title);
+      }
+    }
 
     function fmt(ts) {
       if (!ts) return "";
@@ -695,6 +922,19 @@ INDEX_HTML = r"""<!doctype html>
     function saveHiddenSessions() {
       localStorage.setItem("codexMobileHiddenSessions", JSON.stringify([...hiddenSessionIds]));
     }
+    function setMode(mode) {
+      activeMode = mode === "files" ? "files" : "chat";
+      localStorage.setItem("codexMobileMode", activeMode);
+      qs("#messages").style.display = activeMode === "files" ? "none" : "flex";
+      qs("#composer").style.display = activeMode === "files" ? "none" : "";
+      qs("#fileBrowser").classList.toggle("open", activeMode === "files");
+      if (activeMode === "files") {
+        qs("#threadTitle").textContent = "文件浏览";
+        qs("#terminal").classList.remove("open");
+        terminalOpen = false;
+        loadFiles();
+      }
+    }
     function hideSession(sessionId) {
       hiddenSessionIds.add(sessionId);
       saveHiddenSessions();
@@ -705,13 +945,18 @@ INDEX_HTML = r"""<!doctype html>
       }
       renderSessions();
       forceScrollBottom = true;
-      loadMessages();
+      loadMessages(true);
     }
     function renderSessions() {
       const visibleSessions = sessions.filter(s => !hiddenSessionIds.has(s.id));
       const hiddenSessions = sessions.filter(s => hiddenSessionIds.has(s.id));
       const hiddenCount = sessions.length - visibleSessions.length;
       qs("#sessionCount").textContent = visibleSessions.length + " 个会话" + (hiddenCount ? " · 隐藏 " + hiddenCount : "");
+      const fileHtml = `
+        <div class="file-entry ${activeMode === "files" ? "active" : ""}" id="fileEntry">
+          <div class="title">文件</div>
+          <div class="meta">浏览 /home/wxz 和 /nfs，支持预览与下载</div>
+        </div>`;
       const visibleHtml = visibleSessions.map(s => `
         <div class="session ${s.id === activeId ? "active" : ""}" data-id="${s.id}">
           <div class="session-main">
@@ -720,8 +965,9 @@ INDEX_HTML = r"""<!doctype html>
             <div class="meta" title="${escapeHtml(s.cwd || "")}">${escapeHtml(s.cwd || "")}</div>
           </div>
           <div class="session-actions">
-            <button class="session-action copy-resume" type="button" data-copy-id="${escapeHtml(s.id)}" title="复制 resume 命令">⧉</button>
+            <button class="session-action new-codex" type="button" data-session-id="${escapeHtml(s.id)}" title="新建全权限 Codex 对话">⧉</button>
             <button class="session-action rename-session" type="button" data-rename-id="${escapeHtml(s.id)}" data-title="${escapeHtml(sessionTitle(s))}" title="修改标题">✎</button>
+            <button class="session-action copy-path" type="button" data-path="${escapeHtml(s.cwd || "")}" title="复制路径">⌂</button>
           </div>
         </div>`).join("");
       const hiddenHtml = hiddenSessions.length ? `
@@ -735,17 +981,30 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="session-actions">
               <button class="session-action restore-session" type="button" data-restore-id="${escapeHtml(s.id)}" title="恢复显示">↩</button>
-              <button class="session-action copy-resume" type="button" data-copy-id="${escapeHtml(s.id)}" title="复制 resume 命令">⧉</button>
+              <button class="session-action new-codex" type="button" data-session-id="${escapeHtml(s.id)}" title="新建全权限 Codex 对话">⧉</button>
+              <button class="session-action copy-path" type="button" data-path="${escapeHtml(s.cwd || "")}" title="复制路径">⌂</button>
             </div>
           </div>`).join("") : ""}` : "";
-      qs("#sessions").innerHTML = visibleHtml + hiddenHtml;
+      qs("#sessions").innerHTML = fileHtml + visibleHtml + hiddenHtml;
+      qs("#fileEntry").onclick = () => {
+        setMode("files");
+        qs("#sidebar").classList.remove("open");
+        renderSessions();
+      };
       document.querySelectorAll(".session").forEach(b => b.onclick = () => {
+        const previousId = activeId;
         activeId = b.dataset.id;
+        setMode("chat");
         localStorage.setItem("codexMobileSession", activeId);
         qs("#sidebar").classList.remove("open");
         renderSessions();
         forceScrollBottom = true;
-        loadMessages();
+        if (previousId !== activeId) {
+          const active = sessions.find(s => s.id === activeId);
+          qs("#threadTitle").textContent = active ? sessionTitle(active) : "选择一个会话";
+          qs("#messages").innerHTML = '<div class="notice">加载中...</div>';
+        }
+        loadMessages(true);
       });
       const hiddenToggle = qs("#hiddenToggle");
       if (hiddenToggle) hiddenToggle.onclick = (e) => {
@@ -788,20 +1047,24 @@ INDEX_HTML = r"""<!doctype html>
           }
         }, {passive: true});
       });
-      document.querySelectorAll(".copy-resume").forEach(btn => btn.onclick = async (e) => {
+      document.querySelectorAll(".new-codex").forEach(btn => btn.onclick = async (e) => {
         e.preventDefault();
         e.stopPropagation();
-        const cmd = resumeCommand(btn.dataset.copyId);
+        await startNewCodex(btn.dataset.sessionId, btn);
+      });
+      document.querySelectorAll(".copy-path").forEach(btn => btn.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         try {
-          await copyText(cmd);
+          await copyText(btn.dataset.path || "");
           btn.classList.add("done");
           btn.textContent = "✓";
           setTimeout(() => {
             btn.classList.remove("done");
-            btn.textContent = "⧉";
+            btn.textContent = "⌂";
           }, 1200);
         } catch (err) {
-          addUiError("复制失败：" + (err.message || String(err)));
+          addUiError("复制路径失败：" + (err.message || String(err)));
         }
       });
       document.querySelectorAll(".rename-session").forEach(btn => btn.onclick = async (e) => {
@@ -900,11 +1163,95 @@ INDEX_HTML = r"""<!doctype html>
     }
     function jobLabel(j) {
       if (j.mode === "ui-error") return "错误";
+      if (j.mode === "new-exec" && j.status === "running") return "新对话运行中";
+      if (j.mode === "new-exec" && j.status === "queued") return "新对话已投递";
       if (j.status === "queued") return "已投递";
       if (j.status === "running") return "运行中";
       if (j.status === "failed") return "失败";
       if (j.status === "done") return "已完成";
       return "同步中";
+    }
+    function formatSize(size) {
+      if (size === null || size === undefined) return "";
+      if (size < 1024) return size + " B";
+      if (size < 1024 * 1024) return (size / 1024).toFixed(1) + " KB";
+      if (size < 1024 * 1024 * 1024) return (size / 1024 / 1024).toFixed(1) + " MB";
+      return (size / 1024 / 1024 / 1024).toFixed(1) + " GB";
+    }
+    function fileIcon(item) {
+      if (item.type === "dir") return "📁";
+      if (item.blocked) return "⛔";
+      return "📄";
+    }
+    function downloadUrl(path) {
+      return "/api/files/download?path=" + encodeURIComponent(path) + "&token=" + encodeURIComponent(token);
+    }
+    function isHiddenFileName(name) {
+      return String(name || "").startsWith(".");
+    }
+    async function loadFiles(force = false) {
+      if (activeMode !== "files") return;
+      const res = await api("/api/files/list?path=" + encodeURIComponent(filePath));
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (!force && data.revision && data.revision === fileRevision) return;
+      fileRevision = data.revision || "";
+      filePath = data.path;
+      fileParent = data.parent || "";
+      localStorage.setItem("codexMobileFilePath", filePath);
+      renderFiles(data);
+    }
+    function renderFiles(data) {
+      qs("#filePathInput").value = data.path;
+      qs("#fileUpBtn").disabled = !data.parent;
+      qs("#fileHiddenBtn").textContent = showHiddenFiles ? "隐藏点文件" : "显示隐藏";
+      const visibleItems = showHiddenFiles ? data.items : data.items.filter(item => !isHiddenFileName(item.name));
+      const rows = visibleItems.map(item => `
+        <div class="file-row ${item.path === selectedFilePath ? "active" : ""}" data-path="${attrJson(item.path)}" data-type="${escapeHtml(item.type)}" data-blocked="${item.blocked ? "1" : "0"}">
+          <div>
+            <div class="file-name">${fileIcon(item)} ${escapeHtml(item.name)}</div>
+            <div class="file-meta">${escapeHtml(item.type === "dir" ? "目录" : formatSize(item.size))} · ${escapeHtml(fmt(item.mtime))}${item.blocked ? " · 已屏蔽" : ""}</div>
+          </div>
+          ${item.type === "file" && !item.blocked ? `<a class="file-btn" href="${downloadUrl(item.path)}" download onclick="event.stopPropagation()">下载</a>` : ""}
+        </div>`).join("");
+      qs("#fileList").innerHTML = rows || '<div class="notice">目录为空，或隐藏项已被过滤。</div>';
+      document.querySelectorAll(".file-row").forEach(row => row.onclick = async () => {
+        const path = JSON.parse(row.dataset.path || "\"\"");
+        if (row.dataset.blocked === "1") {
+          qs("#filePreview").innerHTML = '<div class="notice">这个路径已被安全规则屏蔽。</div>';
+          return;
+        }
+        if (row.dataset.type === "dir") {
+          filePath = path;
+          fileRevision = "";
+          selectedFilePath = "";
+          qs("#filePreview").innerHTML = '<div class="notice">选择文件预览，或点击目录进入。</div>';
+          await loadFiles(true);
+          return;
+        }
+        selectedFilePath = path;
+        await previewFile(path);
+        renderFiles(data);
+      });
+    }
+    async function previewFile(path) {
+      qs("#filePreview").innerHTML = '<div class="notice">加载预览...</div>';
+      const res = await api("/api/files/preview?path=" + encodeURIComponent(path));
+      if (!res.ok) {
+        qs("#filePreview").innerHTML = '<div class="notice error">' + escapeHtml(await res.text()) + '</div>';
+        return;
+      }
+      const data = await res.json();
+      const actions = `<div class="file-bar" style="margin-bottom:10px"><div class="file-path">${escapeHtml(data.path)}</div><a class="file-btn" href="${downloadUrl(data.path)}" download>下载</a></div>`;
+      if (data.type === "image") {
+        qs("#filePreview").innerHTML = actions + `<img src="${downloadUrl(data.path)}" alt="${escapeHtml(data.name)}">`;
+      } else if (data.type === "text") {
+        qs("#filePreview").innerHTML = actions + `<pre>${escapeHtml(data.text || "")}</pre>`;
+      } else if (data.type === "too_large") {
+        qs("#filePreview").innerHTML = actions + `<div class="notice">文件过大，大小 ${escapeHtml(formatSize(data.size))}，请下载查看。</div>`;
+      } else {
+        qs("#filePreview").innerHTML = actions + `<div class="notice">这个文件类型暂不支持预览，请下载查看。</div>`;
+      }
     }
     async function loadSessions() {
       const [sessionsRes, loadedRes] = await Promise.all([
@@ -912,8 +1259,15 @@ INDEX_HTML = r"""<!doctype html>
         api("/api/remote/loaded")
       ]);
       if (!sessionsRes.ok) throw new Error(await sessionsRes.text());
-      sessions = await sessionsRes.json();
+      const sessionsPayload = await sessionsRes.json();
+      const nextSessions = Array.isArray(sessionsPayload) ? sessionsPayload : (sessionsPayload.items || []);
+      const nextSessionsRevision = Array.isArray(sessionsPayload) ? "" : (sessionsPayload.revision || "");
       loadedThreadIds = loadedRes.ok ? (await loadedRes.json()).thread_ids || [] : [];
+      const sessionsChanged = !nextSessionsRevision || nextSessionsRevision !== sessionsRevision;
+      if (sessionsChanged) {
+        sessions = nextSessions;
+        sessionsRevision = nextSessionsRevision;
+      }
       currentSessionId = loadedThreadIds.find(id => sessions.some(s => s.id === id)) || "";
       const firstVisible = sessions.find(s => !hiddenSessionIds.has(s.id));
       const currentVisible = currentSessionId && !hiddenSessionIds.has(currentSessionId) ? currentSessionId : "";
@@ -925,21 +1279,34 @@ INDEX_HTML = r"""<!doctype html>
         if (activeId) localStorage.setItem("codexMobileSession", activeId);
       }
       firstSessionLoad = false;
-      renderSessions();
+      if (sessionsChanged) renderSessions();
     }
-    async function loadMessages() {
+    async function loadMessages(forceRender = false) {
+      if (activeMode === "files") return;
       if (!activeId) {
         renderMessages([]);
         return;
       }
       const res = await api("/api/messages?session_id=" + encodeURIComponent(activeId));
       if (!res.ok) throw new Error(await res.text());
-      renderMessages(await res.json());
+      const payload = await res.json();
+      const items = Array.isArray(payload) ? payload : (payload.items || []);
+      const revision = Array.isArray(payload) ? "" : (payload.revision || "");
+      if (!forceRender && revision && messagesRevisionBySession[activeId] === revision) return;
+      messagesRevisionBySession[activeId] = revision;
+      renderMessages(items);
     }
     async function loadJobs() {
       const res = await api("/api/jobs");
       if (!res.ok) throw new Error(await res.text());
-      jobs = await res.json();
+      const nextJobs = await res.json();
+      const nextRevision = JSON.stringify(nextJobs);
+      const changed = nextRevision !== jobsRevision;
+      if (changed) {
+        jobs = nextJobs;
+        jobsRevision = nextRevision;
+      }
+      return changed;
     }
     async function loadTerminal() {
       const res = await api("/api/remote/status");
@@ -957,9 +1324,14 @@ INDEX_HTML = r"""<!doctype html>
     async function refreshAll() {
       try {
         await loadSessions();
-        await loadJobs();
+        if (activeMode === "files") {
+          await loadFiles();
+          lastRefreshError = "";
+          return;
+        }
+        const jobsChanged = await loadJobs();
         await loadTerminal();
-        await loadMessages();
+        await loadMessages(jobsChanged);
         lastRefreshError = "";
       } catch (e) {
         const message = e.message || String(e);
@@ -972,7 +1344,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     async function sendMessage() {
       const text = qs("#input").value.trim();
-      if (!text || !activeId || sending) return;
+      if (activeMode === "files" || !text || !activeId || sending) return;
       sending = true;
       qs("#sendBtn").disabled = true;
       const targetId = activeId;
@@ -997,6 +1369,42 @@ INDEX_HTML = r"""<!doctype html>
       qs("#sendBtn").disabled = false;
       if (!res.ok) {
         addUiError("发送失败：" + await res.text());
+      }
+      await refreshAll();
+    }
+    async function startNewCodex(sessionId, btn) {
+      if (!sessionId) return;
+      const message = window.prompt("新建全权限 Codex 对话", "在当前目录继续处理这个项目");
+      if (message === null) return;
+      const text = message.trim();
+      if (!text) return;
+      const res = await api("/api/new", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({session_id: sessionId, message: text})
+      });
+      if (!res.ok) {
+        addUiError("新建 Codex 对话失败：" + await res.text());
+        await refreshAll();
+        return;
+      }
+      const data = await res.json();
+      if (data && data.job_id) {
+        jobs[data.job_id] = {
+          status: "running",
+          mode: data.mode || "new-exec",
+          started_at: Date.now() / 1000,
+          session_id: sessionId,
+          message: text
+        };
+        if (btn) {
+          btn.classList.add("done");
+          btn.textContent = "✓";
+          setTimeout(() => {
+            btn.classList.remove("done");
+            btn.textContent = "⧉";
+          }, 1200);
+        }
       }
       await refreshAll();
     }
@@ -1119,13 +1527,59 @@ INDEX_HTML = r"""<!doctype html>
       return out.join("");
     }
     qs("#refreshBtn").onclick = refreshAll;
+    applyTheme(document.documentElement.dataset.theme);
+    qs("#themeBtn").onclick = () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    };
     qs("#sessionRefreshBtn").onclick = async (e) => {
       e.preventDefault();
       await refreshAll();
     };
+    qs("#fileRefreshBtn").onclick = async () => {
+      fileRevision = "";
+      await loadFiles(true);
+    };
+    qs("#fileHiddenBtn").onclick = () => {
+      showHiddenFiles = !showHiddenFiles;
+      localStorage.setItem("codexMobileShowHiddenFiles", showHiddenFiles ? "1" : "0");
+      fileRevision = "";
+      loadFiles(true);
+    };
+    qs("#fileGoBtn").onclick = async () => {
+      const nextPath = qs("#filePathInput").value.trim();
+      if (!nextPath) return;
+      filePath = nextPath;
+      fileRevision = "";
+      selectedFilePath = "";
+      qs("#filePreview").innerHTML = '<div class="notice">选择文件预览，或点击目录进入。</div>';
+      await loadFiles(true);
+    };
+    qs("#filePathInput").addEventListener("keydown", async (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      await qs("#fileGoBtn").onclick();
+    });
+    qs("#fileCopyBtn").onclick = async () => {
+      try {
+        await copyText(qs("#filePathInput").value);
+        qs("#fileCopyBtn").textContent = "已复制";
+        setTimeout(() => qs("#fileCopyBtn").textContent = "复制", 1200);
+      } catch (err) {
+        addUiError("复制路径失败：" + (err.message || String(err)));
+      }
+    };
+    qs("#fileUpBtn").onclick = async () => {
+      if (!fileParent) return;
+      filePath = fileParent;
+      fileRevision = "";
+      selectedFilePath = "";
+      qs("#filePreview").innerHTML = '<div class="notice">选择文件预览，或点击目录进入。</div>';
+      await loadFiles(true);
+    };
     qs("#sendBtn").onclick = sendMessage;
     qs("#terminalBtn").onclick = startTerminal;
     qs("#menuBtn").onclick = () => qs("#sidebar").classList.toggle("open");
+    setMode(activeMode);
     qs("#sidebarResizer").addEventListener("pointerdown", e => {
       if (window.matchMedia("(max-width: 760px)").matches) return;
       e.preventDefault();
@@ -1205,6 +1659,18 @@ def list_sessions():
         return sessions
     finally:
         conn.close()
+
+
+def sessions_payload():
+    sessions = list_sessions()
+    revision_parts = "\n".join(
+        f"{item.get('id', '')}:{item.get('updated_at_ms', '')}:{item.get('title', '')}:{item.get('archived', '')}"
+        for item in sessions
+    )
+    return {
+        "revision": hashlib.sha256(revision_parts.encode("utf-8")).hexdigest()[:16],
+        "items": sessions,
+    }
 
 
 def shorten(text, max_len):
@@ -1292,6 +1758,162 @@ def parse_messages(session_id, limit=120):
                 }
             )
     return messages[-limit:]
+
+
+def messages_payload(session_id):
+    session = get_session(session_id)
+    if not session:
+        return {"revision": f"{session_id}:missing", "items": []}
+    path = Path(session["rollout_path"])
+    if not path.exists():
+        return {"revision": f"{session_id}:missing-rollout", "items": []}
+    try:
+        stat = path.stat()
+        revision = f"{session_id}:{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        revision = f"{session_id}:stat-error:{time.time_ns()}"
+    return {
+        "revision": revision,
+        "items": parse_messages(session_id),
+    }
+
+
+def path_is_blocked(path):
+    parts = set(path.parts)
+    if parts & BLOCKED_FILE_PARTS:
+        return True
+    name = path.name
+    if name in BLOCKED_FILE_NAMES:
+        return True
+    if path.suffix.lower() in BLOCKED_FILE_SUFFIXES:
+        return True
+    if ".codex" in parts and name in {"auth.json", "config.toml"}:
+        return True
+    return False
+
+
+def safe_file_path(raw_path, allow_file=True):
+    raw_path = urllib.parse.unquote(raw_path or "")
+    path = Path(raw_path).expanduser() if raw_path else HOME
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        raise ValueError(str(exc))
+    allowed = False
+    for root in FILE_ROOTS:
+        try:
+            resolved.relative_to(root.resolve())
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed:
+        raise PermissionError("path is outside allowed roots")
+    if path_is_blocked(resolved):
+        raise PermissionError("path is blocked")
+    if not allow_file and not resolved.is_dir():
+        raise ValueError("path is not a directory")
+    return resolved
+
+
+def file_item(path):
+    try:
+        stat = path.stat()
+        is_dir = path.is_dir()
+        suffix = path.suffix.lower()
+        blocked = path_is_blocked(path)
+        return {
+            "name": path.name or str(path),
+            "path": str(path),
+            "type": "dir" if is_dir else "file",
+            "size": None if is_dir else stat.st_size,
+            "mtime": int(stat.st_mtime * 1000),
+            "previewable": (
+                not is_dir
+                and not blocked
+                and (suffix in TEXT_PREVIEW_SUFFIXES or suffix in IMAGE_PREVIEW_SUFFIXES)
+                and stat.st_size <= MAX_TEXT_PREVIEW_BYTES
+            ),
+            "blocked": blocked,
+        }
+    except OSError:
+        return None
+
+
+def files_list_payload(raw_path):
+    path = safe_file_path(raw_path, allow_file=False)
+    items = []
+    try:
+        children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError as exc:
+        raise ValueError(str(exc))
+    for child in children:
+        item = file_item(child)
+        if item:
+            items.append(item)
+    revision_src = "\n".join(
+        f"{item['name']}:{item['type']}:{item.get('size')}:{item.get('mtime')}:{item.get('blocked')}"
+        for item in items
+    )
+    parent = None
+    try:
+        parent_path = safe_file_path(str(path.parent), allow_file=False)
+        if parent_path != path:
+            parent = str(parent_path)
+    except Exception:
+        parent = None
+    return {
+        "path": str(path),
+        "parent": parent,
+        "roots": [str(root.resolve()) for root in FILE_ROOTS if root.exists()],
+        "revision": hashlib.sha256((str(path) + "\n" + revision_src).encode("utf-8")).hexdigest()[:16],
+        "items": items,
+    }
+
+
+def files_preview_payload(raw_path):
+    path = safe_file_path(raw_path, allow_file=True)
+    if not path.is_file():
+        raise ValueError("path is not a file")
+    stat = path.stat()
+    suffix = path.suffix.lower()
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    if stat.st_size > MAX_TEXT_PREVIEW_BYTES and suffix not in IMAGE_PREVIEW_SUFFIXES:
+        return {
+            "path": str(path),
+            "name": path.name,
+            "type": "too_large",
+            "size": stat.st_size,
+            "mime": mime,
+            "text": "",
+        }
+    if suffix in IMAGE_PREVIEW_SUFFIXES:
+        return {
+            "path": str(path),
+            "name": path.name,
+            "type": "image",
+            "size": stat.st_size,
+            "mime": mime,
+            "text": "",
+        }
+    if suffix not in TEXT_PREVIEW_SUFFIXES:
+        return {
+            "path": str(path),
+            "name": path.name,
+            "type": "binary",
+            "size": stat.st_size,
+            "mime": mime,
+            "text": "",
+        }
+    data = path.read_bytes()[:MAX_TEXT_PREVIEW_BYTES]
+    return {
+        "path": str(path),
+        "name": path.name,
+        "type": "text",
+        "size": stat.st_size,
+        "mime": mime,
+        "text": data.decode("utf-8", errors="replace"),
+    }
 
 
 class AppServerClient:
@@ -1755,6 +2377,62 @@ def run_codex_job(job_id, session_id, message):
         )
 
 
+def run_new_codex_job(job_id, source_session_id, cwd, message):
+    JOB_OUTPUT_DIR.mkdir(exist_ok=True)
+    output_file = JOB_OUTPUT_DIR / f"{job_id}.txt"
+    cmd = [
+        CODEX_BIN,
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "--json",
+        "-o",
+        str(output_file),
+        "-",
+    ]
+    started = time.time()
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "running",
+            "mode": "new-exec",
+            "started_at": started,
+            "session_id": source_session_id,
+            "cwd": cwd,
+            "message": message,
+            "output": "",
+        }
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=message,
+            text=True,
+            env=codex_env(),
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=None,
+        )
+        status = "done" if proc.returncode == 0 else "failed"
+        output = ""
+        if output_file.exists():
+            output = output_file.read_text(encoding="utf-8", errors="replace").strip()
+        if not output:
+            output = extract_agent_message(proc.stdout)
+        if not output:
+            output = proc.stdout[-8000:]
+    except Exception as exc:
+        status = "failed"
+        output = str(exc)
+    with JOBS_LOCK:
+        JOBS[job_id].update(
+            {
+                "status": status,
+                "completed_at": time.time(),
+                "output": output,
+            }
+        )
+
+
 class Handler(BaseHTTPRequestHandler):
     token = ""
 
@@ -1795,6 +2473,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_file_download(self, path):
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        encoded_name = urllib.parse.quote(path.name)
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded_name}")
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(1024 * 256)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1822,10 +2517,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text("unauthorized", 401)
             return
         if path == "/api/sessions":
-            self.send_json(list_sessions())
+            self.send_json(sessions_payload())
             return
         if path == "/api/messages":
-            self.send_json(parse_messages(params.get("session_id", "")))
+            self.send_json(messages_payload(params.get("session_id", "")))
+            return
+        if path == "/api/files/list":
+            try:
+                self.send_json(files_list_payload(params.get("path", "")))
+            except PermissionError as exc:
+                self.send_text(str(exc), 403)
+            except Exception as exc:
+                self.send_text(str(exc), 400)
+            return
+        if path == "/api/files/preview":
+            try:
+                self.send_json(files_preview_payload(params.get("path", "")))
+            except PermissionError as exc:
+                self.send_text(str(exc), 403)
+            except Exception as exc:
+                self.send_text(str(exc), 400)
+            return
+        if path == "/api/files/download":
+            try:
+                target = safe_file_path(params.get("path", ""), allow_file=True)
+                if not target.is_file():
+                    self.send_text("path is not a file", 400)
+                    return
+                self.send_file_download(target)
+            except PermissionError as exc:
+                self.send_text(str(exc), 403)
+            except Exception as exc:
+                self.send_text(str(exc), 400)
             return
         if path == "/api/jobs":
             with JOBS_LOCK:
@@ -1862,7 +2585,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized(params):
             self.send_text("unauthorized", 401)
             return
-        if path not in {"/api/send", "/api/remote/start", "/api/remote/send", "/api/inputbox/result", "/api/session/title"}:
+        if path not in {"/api/send", "/api/new", "/api/remote/start", "/api/remote/send", "/api/inputbox/result", "/api/session/title"}:
             self.send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -1920,6 +2643,40 @@ class Handler(BaseHTTPRequestHandler):
             session_id = current_loaded_thread_id() or session_id
         if not get_session(session_id):
             self.send_text("unknown session", 404)
+            return
+        if path == "/api/new":
+            session = get_session(session_id)
+            cwd = (session.get("cwd") or "").strip() or str(HOME)
+            try:
+                cwd_path = Path(cwd).expanduser().resolve()
+            except Exception as exc:
+                self.send_text(str(exc), 400)
+                return
+            if not cwd_path.is_dir():
+                self.send_text(f"cwd is not a directory: {cwd_path}", 400)
+                return
+            job_id = secrets.token_hex(8)
+            with JOBS_LOCK:
+                JOBS[job_id] = {
+                    "status": "queued",
+                    "mode": "new-exec",
+                    "started_at": time.time(),
+                    "session_id": session_id,
+                    "cwd": str(cwd_path),
+                    "message": message,
+                    "output": "",
+                }
+            threading.Thread(
+                target=run_new_codex_job,
+                args=(job_id, session_id, str(cwd_path), message),
+                daemon=True,
+            ).start()
+            self.send_json({
+                "job_id": job_id,
+                "status": "queued",
+                "mode": "new-exec",
+                "cwd": str(cwd_path),
+            })
             return
         if path == "/api/remote/send":
             try:
