@@ -1,6 +1,6 @@
 # Codex Mobile
 
-当前版本：`0.2.0-mobile-ui`
+当前版本：`mobile-ui-v3`
 
 版本定位：**CLI + VS Code 兼容 + 移动端增强版**
 
