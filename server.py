@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import secrets
+import signal
 import sqlite3
 import struct
 import subprocess
@@ -21,6 +22,7 @@ HOME = Path.home()
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 STATE_DB = CODEX_HOME / "state_5.sqlite"
 TOKEN_FILE = Path(__file__).with_name("token.txt")
+MOBILE_STATE_FILE = Path(__file__).with_name(".codex_mobile_state.json")
 APP_VERSION = "0.1.1-cli-vscode-compatible"
 DEFAULT_CODEX_BIN = HOME / ".local" / "bin" / "codex"
 
@@ -59,6 +61,8 @@ APP_SERVER_SOCK = CODEX_HOME / "app-server-control" / "app-server-control.sock"
 JOB_OUTPUT_DIR = Path(__file__).with_name("job_outputs")
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+JOB_PROCS = {}
+MOBILE_STATE_LOCK = threading.Lock()
 INPUTBOX_QUEUE = []
 INPUTBOX_LOCK = threading.Lock()
 FILE_ROOTS = [HOME, Path("/nfs")]
@@ -215,6 +219,15 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       gap: 8px;
       min-width: 0;
+      flex: 1;
+    }
+    .action-legend {
+      color: var(--muted);
+      font-size: clamp(11px, 1.1vw, 13px);
+      line-height: 1.25;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      min-width: 0;
     }
     .side-refresh {
       width: 28px;
@@ -239,14 +252,15 @@ INDEX_HTML = r"""<!doctype html>
     }
     .session {
       width: 100%;
-      min-height: 132px;
+      min-height: 154px;
       border: 1px solid transparent;
       border-radius: 8px;
       background: transparent;
       text-align: left;
-      padding: 14px 46px 14px 14px;
+      padding: 12px 46px 12px 14px;
       color: var(--text);
-      display: block;
+      display: flex;
+      align-items: center;
       position: relative;
       cursor: pointer;
       overflow: visible;
@@ -286,18 +300,24 @@ INDEX_HTML = r"""<!doctype html>
     .session .time {
       -webkit-line-clamp: 1;
     }
+    .session .cwd {
+      -webkit-line-clamp: 3;
+    }
     .session-main {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      justify-content: center;
+      gap: 6px;
       min-width: 0;
+      width: 100%;
     }
     .session-actions {
       display: grid;
       gap: 4px;
       position: absolute;
-      top: 10px;
+      top: 50%;
       right: 10px;
+      transform: translateY(-50%);
       width: 24px;
     }
     .session-action {
@@ -391,6 +411,13 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-flex;
       align-items: center;
       justify-content: center;
+    }
+    .file-btn.done,
+    .refresh.done,
+    .side-refresh.done {
+      border-color: var(--active-border);
+      background: var(--soft-bg);
+      color: var(--soft-text);
     }
     .file-layout {
       display: grid;
@@ -772,6 +799,7 @@ INDEX_HTML = r"""<!doctype html>
       <header>
         <div class="side-head">
           <h1>Codex Mobile</h1>
+          <span class="action-legend" title="右侧 ◂ 隐藏/↩ 恢复 · ⧉ 复制对话 · ✎ 重命名 · ⌘ 复制 resume 指令 · ⌂ 复制路径">◂隐藏/↩恢复 · ⧉对话 ✎标题 ⌘指令 ⌂路径</span>
           <button class="side-refresh" id="sessionRefreshBtn" type="button" title="刷新目录">↻</button>
         </div>
         <span class="status" id="sessionCount">加载中</span>
@@ -786,6 +814,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="theme-toggle" id="themeBtn" type="button" title="切换明暗主题">☾</button>
         <button class="mode" id="terminalBtn">历史</button>
         <button class="refresh" id="refreshBtn">刷新</button>
+        <button class="refresh" id="interruptBtn" type="button">中断</button>
       </div>
       <div class="messages" id="messages">
         <div class="notice">选择左侧会话后，就可以在手机上查看消息并发送新指令。</div>
@@ -793,11 +822,12 @@ INDEX_HTML = r"""<!doctype html>
       <div class="file-browser" id="fileBrowser">
         <div class="file-bar">
           <button class="file-btn" id="fileUpBtn" type="button">上级</button>
-          <input class="file-path" id="filePathInput" value="/home/wxz" spellcheck="false" autocomplete="off">
+          <input class="file-path" id="filePathInput" value="~" spellcheck="false" autocomplete="off">
           <button class="file-btn" id="fileGoBtn" type="button">打开</button>
           <button class="file-btn" id="fileCopyBtn" type="button">复制</button>
           <button class="file-btn" id="fileHiddenBtn" type="button">显示隐藏</button>
           <button class="file-btn" id="fileRefreshBtn" type="button">刷新</button>
+          <button class="file-btn" id="fileNewCodexBtn" type="button">新建 Codex 对话</button>
         </div>
         <div class="file-layout">
           <div class="file-list" id="fileList"></div>
@@ -836,13 +866,13 @@ INDEX_HTML = r"""<!doctype html>
     let sessionsRevision = "";
     let messagesRevisionBySession = {};
     let jobsRevision = "";
-    let filePath = localStorage.getItem("codexMobileFilePath") || "/home/wxz";
+    let filePath = localStorage.getItem("codexMobileFilePath") || "";
     let fileParent = "";
     let fileRevision = "";
     let selectedFilePath = "";
     let showHiddenFiles = localStorage.getItem("codexMobileShowHiddenFiles") === "1";
     let hiddenSessionIds = new Set(JSON.parse(localStorage.getItem("codexMobileHiddenSessions") || "[]"));
-    let titleOverrides = JSON.parse(localStorage.getItem("codexMobileSessionTitles") || "{}");
+    let titleOverrides = {};
     let hiddenPanelOpen = localStorage.getItem("codexMobileHiddenPanelOpen") === "1";
     const qs = (s) => document.querySelector(s);
     const api = (path, opts = {}) => fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token), opts);
@@ -899,9 +929,10 @@ INDEX_HTML = r"""<!doctype html>
         body: JSON.stringify({session_id: sessionId, title})
       });
       if (!res.ok) {
-        addUiError("标题已保存在手机本地，但写入 Codex 历史库失败：" + await res.text());
+        addUiError("标题已保存在当前页面，但写入服务端失败：" + await res.text());
         return;
       }
+      titleOverrides = {};
       await loadSessions();
     }
     async function copyText(text) {
@@ -935,7 +966,16 @@ INDEX_HTML = r"""<!doctype html>
         loadFiles();
       }
     }
-    function hideSession(sessionId) {
+    async function setSessionHidden(sessionId, hidden) {
+      const res = await api("/api/session/hide", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({session_id: sessionId, hidden})
+      });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+    async function hideSession(sessionId) {
       hiddenSessionIds.add(sessionId);
       saveHiddenSessions();
       if (activeId === sessionId) {
@@ -946,27 +986,36 @@ INDEX_HTML = r"""<!doctype html>
       renderSessions();
       forceScrollBottom = true;
       loadMessages(true);
+      try {
+        await setSessionHidden(sessionId, true);
+        await loadSessions();
+      } catch (err) {
+        addUiError("隐藏状态只保存在当前浏览器，写入服务端失败：" + (err.message || String(err)));
+      }
     }
     function renderSessions() {
-      const visibleSessions = sessions.filter(s => !hiddenSessionIds.has(s.id));
-      const hiddenSessions = sessions.filter(s => hiddenSessionIds.has(s.id));
+      const isHidden = (s) => hiddenSessionIds.has(s.id) || !!s.hidden;
+      const visibleSessions = sessions.filter(s => !isHidden(s));
+      const hiddenSessions = sessions.filter(s => isHidden(s));
       const hiddenCount = sessions.length - visibleSessions.length;
       qs("#sessionCount").textContent = visibleSessions.length + " 个会话" + (hiddenCount ? " · 隐藏 " + hiddenCount : "");
       const fileHtml = `
         <div class="file-entry ${activeMode === "files" ? "active" : ""}" id="fileEntry">
           <div class="title">文件</div>
-          <div class="meta">浏览 /home/wxz 和 /nfs，支持预览与下载</div>
+          <div class="meta">浏览目录，支持预览与下载</div>
         </div>`;
       const visibleHtml = visibleSessions.map(s => `
         <div class="session ${s.id === activeId ? "active" : ""}" data-id="${s.id}">
           <div class="session-main">
             <div class="title">${escapeHtml(sessionTitle(s))}</div>
             <div class="meta time">${escapeHtml((s.id === currentSessionId ? "当前窗口 · " : "") + fmt(s.updated_at_ms))}</div>
-            <div class="meta" title="${escapeHtml(s.cwd || "")}">${escapeHtml(s.cwd || "")}</div>
+            <div class="meta cwd" title="${escapeHtml(s.cwd || "")}">${escapeHtml(s.cwd || "")}</div>
           </div>
           <div class="session-actions">
-            <button class="session-action new-codex" type="button" data-session-id="${escapeHtml(s.id)}" title="新建全权限 Codex 对话">⧉</button>
+            <button class="session-action hide-session" type="button" data-hide-id="${escapeHtml(s.id)}" title="隐藏对话">◂</button>
+            <button class="session-action copy-conversation" type="button" data-session-id="${escapeHtml(s.id)}" title="复制对话">⧉</button>
             <button class="session-action rename-session" type="button" data-rename-id="${escapeHtml(s.id)}" data-title="${escapeHtml(sessionTitle(s))}" title="修改标题">✎</button>
+            <button class="session-action copy-resume" type="button" data-copy-id="${escapeHtml(s.id)}" title="复制 resume 指令">⌘</button>
             <button class="session-action copy-path" type="button" data-path="${escapeHtml(s.cwd || "")}" title="复制路径">⌂</button>
           </div>
         </div>`).join("");
@@ -977,11 +1026,13 @@ INDEX_HTML = r"""<!doctype html>
             <div class="session-main">
               <div class="title">${escapeHtml(sessionTitle(s))}</div>
               <div class="meta time">${escapeHtml(fmt(s.updated_at_ms))}</div>
-              <div class="meta" title="${escapeHtml(s.cwd || "")}">${escapeHtml(s.cwd || "")}</div>
+              <div class="meta cwd" title="${escapeHtml(s.cwd || "")}">${escapeHtml(s.cwd || "")}</div>
             </div>
             <div class="session-actions">
               <button class="session-action restore-session" type="button" data-restore-id="${escapeHtml(s.id)}" title="恢复显示">↩</button>
-              <button class="session-action new-codex" type="button" data-session-id="${escapeHtml(s.id)}" title="新建全权限 Codex 对话">⧉</button>
+              <button class="session-action copy-conversation" type="button" data-session-id="${escapeHtml(s.id)}" title="复制对话">⧉</button>
+              <button class="session-action rename-session" type="button" data-rename-id="${escapeHtml(s.id)}" data-title="${escapeHtml(sessionTitle(s))}" title="修改标题">✎</button>
+              <button class="session-action copy-resume" type="button" data-copy-id="${escapeHtml(s.id)}" title="复制 resume 指令">⌘</button>
               <button class="session-action copy-path" type="button" data-path="${escapeHtml(s.cwd || "")}" title="复制路径">⌂</button>
             </div>
           </div>`).join("") : ""}` : "";
@@ -1015,7 +1066,7 @@ INDEX_HTML = r"""<!doctype html>
         renderSessions();
       };
       document.querySelectorAll(".session").forEach(card => {
-        if (hiddenSessionIds.has(card.dataset.id)) return;
+        if (hiddenSessionIds.has(card.dataset.id) || sessions.some(s => s.id === card.dataset.id && s.hidden)) return;
         let startX = 0;
         let startY = 0;
         let swiping = false;
@@ -1047,10 +1098,26 @@ INDEX_HTML = r"""<!doctype html>
           }
         }, {passive: true});
       });
-      document.querySelectorAll(".new-codex").forEach(btn => btn.onclick = async (e) => {
+      document.querySelectorAll(".copy-conversation").forEach(btn => btn.onclick = async (e) => {
         e.preventDefault();
         e.stopPropagation();
-        await startNewCodex(btn.dataset.sessionId, btn);
+        await copyConversation(btn.dataset.sessionId, btn);
+      });
+      document.querySelectorAll(".copy-resume").forEach(btn => btn.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const cmd = resumeCommand(btn.dataset.copyId);
+        try {
+          await copyText(cmd);
+          btn.classList.add("done");
+          btn.textContent = "✓";
+          setTimeout(() => {
+            btn.classList.remove("done");
+            btn.textContent = "⌘";
+          }, 1200);
+        } catch (err) {
+          addUiError("复制指令失败：" + (err.message || String(err)));
+        }
       });
       document.querySelectorAll(".copy-path").forEach(btn => btn.onclick = async (e) => {
         e.preventDefault();
@@ -1078,6 +1145,17 @@ INDEX_HTML = r"""<!doctype html>
         hiddenSessionIds.delete(btn.dataset.restoreId);
         saveHiddenSessions();
         renderSessions();
+        try {
+          await setSessionHidden(btn.dataset.restoreId, false);
+          await loadSessions();
+        } catch (err) {
+          addUiError("恢复状态只保存在当前浏览器，写入服务端失败：" + (err.message || String(err)));
+        }
+      });
+      document.querySelectorAll(".hide-session").forEach(btn => btn.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        await hideSession(btn.dataset.hideId);
       });
     }
     function nearBottom(el) {
@@ -1098,6 +1176,36 @@ INDEX_HTML = r"""<!doctype html>
         output: ""
       });
       uiEvents = uiEvents.slice(-30);
+    }
+    function addUiNotice(text) {
+      const message = String(text || "");
+      if (!message) return;
+      const id = "ui-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+      uiEvents.push({
+        id,
+        session_id: activeId,
+        status: "running",
+        mode: "ui-notice",
+        started_at: Date.now() / 1000,
+        message,
+        output: ""
+      });
+      uiEvents = uiEvents.slice(-30);
+      if (activeMode !== "files") renderMessages(lastRenderedItems);
+      setTimeout(() => {
+        uiEvents = uiEvents.filter(item => item.id !== id);
+        if (activeMode !== "files") renderMessages(lastRenderedItems);
+      }, 2600);
+    }
+    function flashButton(btn, text, originalText) {
+      if (!btn) return;
+      const before = originalText || btn.textContent;
+      btn.classList.add("done");
+      btn.textContent = text;
+      setTimeout(() => {
+        btn.classList.remove("done");
+        btn.textContent = before;
+      }, 1200);
     }
     function renderMessages(items) {
       lastRenderedItems = items;
@@ -1163,6 +1271,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     function jobLabel(j) {
       if (j.mode === "ui-error") return "错误";
+      if (j.mode === "ui-notice") return "提示";
       if (j.mode === "new-exec" && j.status === "running") return "新对话运行中";
       if (j.mode === "new-exec" && j.status === "queued") return "新对话已投递";
       if (j.status === "queued") return "已投递";
@@ -1268,13 +1377,17 @@ INDEX_HTML = r"""<!doctype html>
         sessions = nextSessions;
         sessionsRevision = nextSessionsRevision;
       }
+      const serverHiddenIds = new Set(nextSessions.filter(s => s.hidden).map(s => s.id));
+      serverHiddenIds.forEach(id => hiddenSessionIds.add(id));
+      saveHiddenSessions();
       currentSessionId = loadedThreadIds.find(id => sessions.some(s => s.id === id)) || "";
-      const firstVisible = sessions.find(s => !hiddenSessionIds.has(s.id));
-      const currentVisible = currentSessionId && !hiddenSessionIds.has(currentSessionId) ? currentSessionId : "";
+      const isHiddenSessionId = (id) => hiddenSessionIds.has(id) || sessions.some(s => s.id === id && s.hidden);
+      const firstVisible = sessions.find(s => !isHiddenSessionId(s.id));
+      const currentVisible = currentSessionId && !isHiddenSessionId(currentSessionId) ? currentSessionId : "";
       if (firstSessionLoad && !explicitSessionId) {
         activeId = currentVisible || (firstVisible && firstVisible.id) || activeId;
         if (activeId) localStorage.setItem("codexMobileSession", activeId);
-      } else if ((firstSessionLoad && currentVisible && explicitSessionId === currentVisible) || hiddenSessionIds.has(activeId) || !sessions.some(s => s.id === activeId)) {
+      } else if ((firstSessionLoad && currentVisible && explicitSessionId === currentVisible) || isHiddenSessionId(activeId) || !sessions.some(s => s.id === activeId)) {
         activeId = currentVisible || (firstVisible && firstVisible.id) || "";
         if (activeId) localStorage.setItem("codexMobileSession", activeId);
       }
@@ -1372,8 +1485,31 @@ INDEX_HTML = r"""<!doctype html>
       }
       await refreshAll();
     }
-    async function startNewCodex(sessionId, btn) {
+    async function copyConversation(sessionId, btn) {
       if (!sessionId) return;
+      const res = await api("/api/messages?session_id=" + encodeURIComponent(sessionId));
+      if (!res.ok) {
+        addUiError("复制对话失败：" + await res.text());
+        return;
+      }
+      const payload = await res.json();
+      const items = Array.isArray(payload) ? payload : (payload.items || []);
+      const text = items.map(m => `${m.role === "user" ? "User" : "Codex"} (${fmt(m.timestamp)}):\n${m.text || ""}`).join("\n\n");
+      try {
+        await copyText(text);
+        if (btn) {
+          btn.classList.add("done");
+          btn.textContent = "✓";
+          setTimeout(() => {
+            btn.classList.remove("done");
+            btn.textContent = "⧉";
+          }, 1200);
+        }
+      } catch (err) {
+        addUiError("复制对话失败：" + (err.message || String(err)));
+      }
+    }
+    async function startNewCodex(sessionId, btn, cwd = "") {
       const message = window.prompt("新建全权限 Codex 对话", "在当前目录继续处理这个项目");
       if (message === null) return;
       const text = message.trim();
@@ -1381,7 +1517,7 @@ INDEX_HTML = r"""<!doctype html>
       const res = await api("/api/new", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({session_id: sessionId, message: text})
+        body: JSON.stringify({session_id: sessionId || "", cwd: cwd || "", message: text})
       });
       if (!res.ok) {
         addUiError("新建 Codex 对话失败：" + await res.text());
@@ -1412,6 +1548,33 @@ INDEX_HTML = r"""<!doctype html>
       terminalOpen = !terminalOpen;
       qs("#terminal").classList.toggle("open", terminalOpen);
       qs("#terminalBtn").textContent = terminalOpen ? "隐藏" : "状态";
+      await refreshAll();
+    }
+    async function refreshWithNotice(btn) {
+      await refreshAll();
+      if (activeMode === "files") {
+        flashButton(btn, "已刷新");
+      } else {
+        addUiNotice("已刷新");
+        flashButton(btn, "已刷新");
+      }
+    }
+    async function interruptActive() {
+      const btn = qs("#interruptBtn");
+      flashButton(btn, "中断中", "中断");
+      const res = await api("/api/interrupt", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({session_id: activeMode === "files" ? "" : activeId})
+      });
+      if (!res.ok) {
+        addUiError("中断失败：" + await res.text());
+        flashButton(btn, "失败", "中断");
+        return;
+      }
+      const data = await res.json();
+      addUiNotice("已中断，匹配任务 " + (data.interrupted || 0) + " 个。");
+      flashButton(btn, "已中断", "中断");
       await refreshAll();
     }
     function escapeHtml(x) {
@@ -1526,18 +1689,19 @@ INDEX_HTML = r"""<!doctype html>
       closeList();
       return out.join("");
     }
-    qs("#refreshBtn").onclick = refreshAll;
+    qs("#refreshBtn").onclick = () => refreshWithNotice(qs("#refreshBtn"));
     applyTheme(document.documentElement.dataset.theme);
     qs("#themeBtn").onclick = () => {
       applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     };
     qs("#sessionRefreshBtn").onclick = async (e) => {
       e.preventDefault();
-      await refreshAll();
+      await refreshWithNotice(qs("#sessionRefreshBtn"));
     };
     qs("#fileRefreshBtn").onclick = async () => {
       fileRevision = "";
       await loadFiles(true);
+      flashButton(qs("#fileRefreshBtn"), "已刷新", "刷新");
     };
     qs("#fileHiddenBtn").onclick = () => {
       showHiddenFiles = !showHiddenFiles;
@@ -1568,6 +1732,9 @@ INDEX_HTML = r"""<!doctype html>
         addUiError("复制路径失败：" + (err.message || String(err)));
       }
     };
+    qs("#fileNewCodexBtn").onclick = async () => {
+      await startNewCodex("", qs("#fileNewCodexBtn"), qs("#filePathInput").value.trim() || filePath);
+    };
     qs("#fileUpBtn").onclick = async () => {
       if (!fileParent) return;
       filePath = fileParent;
@@ -1578,6 +1745,7 @@ INDEX_HTML = r"""<!doctype html>
     };
     qs("#sendBtn").onclick = sendMessage;
     qs("#terminalBtn").onclick = startTerminal;
+    qs("#interruptBtn").onclick = interruptActive;
     qs("#menuBtn").onclick = () => qs("#sidebar").classList.toggle("open");
     setMode(activeMode);
     qs("#sidebarResizer").addEventListener("pointerdown", e => {
@@ -1629,6 +1797,41 @@ def db_write_connect():
     return sqlite3.connect(STATE_DB)
 
 
+def default_mobile_state():
+    return {"titles": {}, "hidden_sessions": []}
+
+
+def read_mobile_state():
+    with MOBILE_STATE_LOCK:
+        if not MOBILE_STATE_FILE.exists():
+            return default_mobile_state()
+        try:
+            data = json.loads(MOBILE_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return default_mobile_state()
+        if not isinstance(data, dict):
+            return default_mobile_state()
+        titles = data.get("titles") if isinstance(data.get("titles"), dict) else {}
+        hidden = data.get("hidden_sessions") if isinstance(data.get("hidden_sessions"), list) else []
+        return {
+            "titles": {str(k): shorten(str(v), 180) for k, v in titles.items() if str(k) and str(v).strip()},
+            "hidden_sessions": sorted({str(x) for x in hidden if str(x)}),
+        }
+
+
+def write_mobile_state(state):
+    with MOBILE_STATE_LOCK:
+        normalized = {
+            "titles": state.get("titles", {}),
+            "hidden_sessions": sorted(set(state.get("hidden_sessions", []))),
+        }
+        tmp = MOBILE_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(MOBILE_STATE_FILE)
+        return normalized
+
+
 def list_sessions():
     conn = db_connect()
     conn.row_factory = sqlite3.Row
@@ -1663,8 +1866,16 @@ def list_sessions():
 
 def sessions_payload():
     sessions = list_sessions()
+    mobile_state = read_mobile_state()
+    titles = mobile_state.get("titles", {})
+    hidden = set(mobile_state.get("hidden_sessions", []))
+    for item in sessions:
+        if item.get("id") in titles:
+            item["title"] = titles[item["id"]]
+            item["mobile_title"] = True
+        item["hidden"] = item.get("id") in hidden
     revision_parts = "\n".join(
-        f"{item.get('id', '')}:{item.get('updated_at_ms', '')}:{item.get('title', '')}:{item.get('archived', '')}"
+        f"{item.get('id', '')}:{item.get('updated_at_ms', '')}:{item.get('title', '')}:{item.get('archived', '')}:{item.get('hidden', '')}"
         for item in sessions
     )
     return {
@@ -1695,19 +1906,49 @@ def update_session_title(session_id, title):
     title = shorten(title, 180)
     if not title:
         raise ValueError("title is required")
-    conn = db_write_connect()
+    if not get_session(session_id):
+        raise ValueError("unknown session")
+    state = read_mobile_state()
+    state.setdefault("titles", {})[session_id] = title
+    write_mobile_state(state)
+    db_written = False
+    db_error = ""
+    now_ms = int(time.time() * 1000)
     try:
-        now_ms = int(time.time() * 1000)
-        cur = conn.execute(
-            "update threads set title = ?, updated_at_ms = ? where id = ?",
-            (title, now_ms, session_id),
-        )
-        if cur.rowcount == 0:
-            raise ValueError("unknown session")
-        conn.commit()
-        return {"session_id": session_id, "title": title, "updated_at_ms": now_ms}
-    finally:
-        conn.close()
+        conn = db_write_connect()
+        try:
+            conn.execute(
+                "update threads set title = ?, updated_at_ms = ? where id = ?",
+                (title, now_ms, session_id),
+            )
+            conn.commit()
+            db_written = True
+        finally:
+            conn.close()
+    except Exception as exc:
+        db_error = str(exc)
+    return {
+        "session_id": session_id,
+        "title": title,
+        "updated_at_ms": now_ms,
+        "server_state": True,
+        "db_written": db_written,
+        "db_error": db_error,
+    }
+
+
+def update_session_hidden(session_id, hidden):
+    if not get_session(session_id):
+        raise ValueError("unknown session")
+    state = read_mobile_state()
+    hidden_sessions = set(state.get("hidden_sessions", []))
+    if hidden:
+        hidden_sessions.add(session_id)
+    else:
+        hidden_sessions.discard(session_id)
+    state["hidden_sessions"] = sorted(hidden_sessions)
+    write_mobile_state(state)
+    return {"session_id": session_id, "hidden": bool(hidden)}
 
 
 def content_text(content):
@@ -2320,6 +2561,27 @@ def extract_agent_message(stdout):
     return last.strip()
 
 
+def run_codex_process(job_id, cmd, message, cwd):
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=codex_env(),
+        cwd=cwd,
+        start_new_session=True,
+    )
+    with JOBS_LOCK:
+        JOB_PROCS[job_id] = proc
+    try:
+        stdout, _ = proc.communicate(input=message)
+        return proc.returncode, stdout or ""
+    finally:
+        with JOBS_LOCK:
+            JOB_PROCS.pop(job_id, None)
+
+
 def run_codex_job(job_id, session_id, message):
     JOB_OUTPUT_DIR.mkdir(exist_ok=True)
     output_file = JOB_OUTPUT_DIR / f"{job_id}.txt"
@@ -2346,24 +2608,17 @@ def run_codex_job(job_id, session_id, message):
             "output": "",
         }
     try:
-        proc = subprocess.run(
-            cmd,
-            input=message,
-            text=True,
-            env=codex_env(),
-            cwd=str(HOME),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=None,
-        )
-        status = "done" if proc.returncode == 0 else "failed"
+        returncode, stdout = run_codex_process(job_id, cmd, message, str(HOME))
+        status = "done" if returncode == 0 else "failed"
         output = ""
         if output_file.exists():
             output = output_file.read_text(encoding="utf-8", errors="replace").strip()
         if not output:
-            output = extract_agent_message(proc.stdout)
+            output = extract_agent_message(stdout)
+        if not output and returncode in {-signal.SIGINT, 130}:
+            output = "已中断。"
         if not output:
-            output = proc.stdout[-8000:]
+            output = stdout[-8000:]
     except Exception as exc:
         status = "failed"
         output = str(exc)
@@ -2402,24 +2657,17 @@ def run_new_codex_job(job_id, source_session_id, cwd, message):
             "output": "",
         }
     try:
-        proc = subprocess.run(
-            cmd,
-            input=message,
-            text=True,
-            env=codex_env(),
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=None,
-        )
-        status = "done" if proc.returncode == 0 else "failed"
+        returncode, stdout = run_codex_process(job_id, cmd, message, cwd)
+        status = "done" if returncode == 0 else "failed"
         output = ""
         if output_file.exists():
             output = output_file.read_text(encoding="utf-8", errors="replace").strip()
         if not output:
-            output = extract_agent_message(proc.stdout)
+            output = extract_agent_message(stdout)
+        if not output and returncode in {-signal.SIGINT, 130}:
+            output = "已中断。"
         if not output:
-            output = proc.stdout[-8000:]
+            output = stdout[-8000:]
     except Exception as exc:
         status = "failed"
         output = str(exc)
@@ -2585,7 +2833,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized(params):
             self.send_text("unauthorized", 401)
             return
-        if path not in {"/api/send", "/api/new", "/api/remote/start", "/api/remote/send", "/api/inputbox/result", "/api/session/title"}:
+        if path not in {"/api/send", "/api/new", "/api/interrupt", "/api/remote/start", "/api/remote/send", "/api/inputbox/result", "/api/session/title", "/api/session/hide"}:
             self.send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -2624,51 +2872,112 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_text(str(exc), 400)
             return
+        if path == "/api/session/hide":
+            session_id = (data.get("session_id") or "").strip()
+            hidden = bool(data.get("hidden"))
+            if not session_id:
+                self.send_text("session_id is required", 400)
+                return
+            try:
+                self.send_json(update_session_hidden(session_id, hidden))
+            except Exception as exc:
+                self.send_text(str(exc), 400)
+            return
         if path == "/api/remote/start":
             try:
                 self.send_json(ensure_remote_control())
             except Exception as exc:
                 self.send_text(str(exc), 500)
             return
+        if path == "/api/interrupt":
+            session_id = (data.get("session_id") or "").strip()
+            interrupted = 0
+            errors = []
+            with JOBS_LOCK:
+                for job_id, proc in list(JOB_PROCS.items()):
+                    job = JOBS.get(job_id, {})
+                    if session_id and job.get("session_id") != session_id:
+                        continue
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGINT)
+                        except ProcessLookupError:
+                            pass
+                        except Exception as exc:
+                            try:
+                                proc.send_signal(signal.SIGINT)
+                            except Exception:
+                                proc.terminate()
+                            errors.append(str(exc))
+                        interrupted += 1
+                        job.update({
+                            "status": "failed",
+                            "completed_at": time.time(),
+                            "output": "已发送 Ctrl+C 中断。",
+                        })
+            self.send_json({"interrupted": interrupted, "errors": errors})
+            return
         session_id = (data.get("session_id") or "").strip()
         message = (data.get("message") or "").strip()
-        if not session_id:
-            self.send_text("session_id is required", 400)
-            return
         if not message:
             self.send_text("message is required", 400)
             return
         requested_session_id = session_id
         if path == "/api/remote/send":
             session_id = current_loaded_thread_id() or session_id
-        if not get_session(session_id):
-            self.send_text("unknown session", 404)
+        if path != "/api/new" and not session_id:
+            self.send_text("session_id is required", 400)
             return
+        if not get_session(session_id):
+            if path == "/api/new" and (data.get("cwd") or "").strip():
+                pass
+            else:
+                self.send_text("unknown session", 404)
+                return
         if path == "/api/new":
-            session = get_session(session_id)
-            cwd = (session.get("cwd") or "").strip() or str(HOME)
-            try:
-                cwd_path = Path(cwd).expanduser().resolve()
-            except Exception as exc:
-                self.send_text(str(exc), 400)
-                return
-            if not cwd_path.is_dir():
-                self.send_text(f"cwd is not a directory: {cwd_path}", 400)
-                return
+            cwd_input = (data.get("cwd") or "").strip()
+            if cwd_input:
+                try:
+                    cwd_path = safe_file_path(cwd_input, allow_file=False)
+                except PermissionError as exc:
+                    self.send_text(str(exc), 403)
+                    return
+                except Exception as exc:
+                    self.send_text(str(exc), 400)
+                    return
+                source_session_id = session_id or "__files__"
+            else:
+                if not session_id:
+                    self.send_text("session_id or cwd is required", 400)
+                    return
+                session = get_session(session_id)
+                if not session:
+                    self.send_text("unknown session", 404)
+                    return
+                cwd = (session.get("cwd") or "").strip() or str(HOME)
+                try:
+                    cwd_path = Path(cwd).expanduser().resolve()
+                except Exception as exc:
+                    self.send_text(str(exc), 400)
+                    return
+                if not cwd_path.is_dir():
+                    self.send_text(f"cwd is not a directory: {cwd_path}", 400)
+                    return
+                source_session_id = session_id
             job_id = secrets.token_hex(8)
             with JOBS_LOCK:
                 JOBS[job_id] = {
                     "status": "queued",
                     "mode": "new-exec",
                     "started_at": time.time(),
-                    "session_id": session_id,
+                    "session_id": source_session_id,
                     "cwd": str(cwd_path),
                     "message": message,
                     "output": "",
                 }
             threading.Thread(
                 target=run_new_codex_job,
-                args=(job_id, session_id, str(cwd_path), message),
+                args=(job_id, source_session_id, str(cwd_path), message),
                 daemon=True,
             ).start()
             self.send_json({
@@ -2677,6 +2986,9 @@ class Handler(BaseHTTPRequestHandler):
                 "mode": "new-exec",
                 "cwd": str(cwd_path),
             })
+            return
+        if not get_session(session_id):
+            self.send_text("unknown session", 404)
             return
         if path == "/api/remote/send":
             try:

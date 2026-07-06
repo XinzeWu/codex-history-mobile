@@ -89,11 +89,19 @@ codex exec --dangerously-bypass-approvals-and-sandbox resume ...
 - 支持复制 `codex resume <session_id>` 命令，方便电脑端重新打开指定会话。
 - 支持复制用户消息、Codex 回复和网页任务输出。
 - 支持 Markdown 渲染，包括代码块、列表、引用、链接和表格。
-- 支持在手机端修改会话标题；标题会保存在浏览器本地，并尝试写回 Codex state DB。
-- 支持左滑隐藏目录项；隐藏状态保存在浏览器本地，不删除任何 Codex 本地文件。
+- 会话卡片右侧提供 5 个快捷按钮：隐藏/恢复、复制对话、重命名、复制 resume 指令、复制路径。
+- 支持在网页端修改会话标题；标题写入服务端 `.codex_mobile_state.json`，多设备访问同一服务时保持一致，并尽量同步回 Codex state DB。
+- 支持隐藏/恢复会话；隐藏状态写入服务端 `.codex_mobile_state.json`，不删除任何 Codex 本地文件。
 - 支持折叠查看隐藏会话并逐个恢复。
+- 支持文件浏览入口，从当前用户 `~` 目录开始，可浏览 `/home/<user>` 和 `/nfs`，支持文件预览和下载。
+- 文件浏览支持隐藏点文件、显示隐藏文件、路径输入跳转、复制当前路径。
+- 文件浏览中可以在当前目录直接启动一个新的全权限 Codex 对话。
+- 支持中断网页启动的 Codex 任务；中断使用 Ctrl+C 语义发送到 Codex 进程组。
+- 支持浅色/深色主题切换。
 - 桌面端目录栏可拖拽调整宽度，移动端目录栏全屏展示。
 - 后台 job 状态展示：排队、运行、失败。
+- 会话列表、消息历史、job 状态和文件列表使用 revision 判断；没有变化时跳过 DOM 重绘，减少刷新时对滚动和横向浏览的干扰。
+- 刷新和中断按钮会在界面中给出即时反馈。
 - 刷新时不强制滚动到底部，方便在手机上阅读历史。
 - systemd 用户服务保活，SSH 断开后继续运行。
 - Cloudflare quick tunnel 支持公网访问。
@@ -239,9 +247,9 @@ loginctl enable-linger "$USER"
 
 ```text
 token.txt
-server.log
-tunnel.log
-*.pid
+.codex_mobile_state.json
+logs/
+run/
 job_outputs/
 ```
 

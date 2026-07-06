@@ -3,7 +3,10 @@ __pycache__/
 *.log
 *.pid
 token.txt
+.codex_mobile_state.json
 job_outputs/
+logs/
+run/
 bin/cloudflared
 .DS_Store
 .env
